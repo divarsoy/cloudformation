@@ -1,0 +1,139 @@
+AWSTemplateFormatVersion: 2010-09-09
+Description: SFTServer.yaml - SFTP server with notification 
+
+Parameters:
+  LatestLinuxAmiId:
+    Type: AWS::SSM::Parameter::Value<AWS::EC2::Image::Id>
+    Default: '/aws/service/ami-amazon-linux-latest/amzn2-ami-hvm-x86_64-gp2'
+    Description: "AMI to use (Leave as default for latest linux2 AMI)"
+  KeyPair:
+    Type: AWS::EC2::KeyPair::KeyName
+    Description: "Keypair used to login to the instance via ssh"
+  Username:
+    Type: String
+    Description: "Username for SFTP user"
+  Password:
+    Type: String
+    Description: "Password for SFTP user"
+    NoEcho: true
+  NotificationTopic:
+    Type: String
+    Description: "Arn to the SNS topic that will be alerted when a file has been uploaded (Required)"
+    MinLength: 1
+  EBSVolumeSize:
+    Type: Number
+    Default: 8
+    MinValue: 8
+    Description: "Size in GB of the EBS volume (Operating system and storage). Minimum value is 8 GB"
+
+Resources:
+  SFTPRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+              - ec2.amazonaws.com
+            Action:
+              - 'sts:AssumeRole'
+      Path: /
+      Policies:
+        - PolicyName: "SNSPublish"
+          PolicyDocument:
+            Version: 2012-10-17
+            Statement:
+              - Effect: Allow
+                Action:
+                  - 'sns:Publish'
+                Resource: "*"
+  SFTPInstanceProfile:
+    Type: AWS::IAM::InstanceProfile
+    Properties:
+      Path: /
+      Roles:
+        - !Ref SFTPRole
+
+  SFTPSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: "SFTP"
+      SecurityGroupIngress:
+      - IpProtocol: tcp
+        FromPort: 22
+        ToPort: 22
+        CidrIp: 0.0.0.0/0
+        Description: "Everyone"
+
+  SFTPInstance:
+    Type: AWS::EC2::Instance
+    Properties:
+      ImageId: !Ref LatestLinuxAmiId
+      InstanceType: t2.micro
+      KeyName: !Ref KeyPair
+      IamInstanceProfile: !Ref SFTPInstanceProfile
+      Tags:
+        - Key: "Name"
+          Value: "SFTP"
+      SecurityGroups:
+        - !Ref SFTPSecurityGroup
+      BlockDeviceMappings:
+        - DeviceName: "/dev/xvda"
+          Ebs:
+            VolumeSize: !Ref EBSVolumeSize
+            Encrypted: true  
+      UserData:
+        Fn::Base64:
+          !Sub |
+            #!/bin/bash -xe
+
+            # Install packages
+            yum-config-manager --enable epel
+            yum install -y https://dl.fedoraproject.org/pub/epel/epel-release-latest-7.noarch.rpm
+            yum update -y
+            yum -y install inotify-tools
+
+            # Setup user and group for sftp
+            groupadd sftponly
+            useradd -g sftponly -d /upload -s /sbin/nologin ${Username}
+            echo '${Username}:${Password}' | chpasswd
+
+            # Create user directory for uploads
+            mkdir -p /data
+            chmod 701 /data
+            mkdir -p /data/${Username}/upload
+            chown -R root:sftponly /data/${Username}
+            chown -R ${Username}:sftponly /data/${Username}/upload
+
+            # Configure ssh to allow sftp
+            sed -i 's/PasswordAuthentication no/PasswordAuthentication yes/' /etc/ssh/sshd_config
+            echo 'Match Group sftponly' >> /etc/ssh/sshd_config
+            echo 'ChrootDirectory /data/%u' >> /etc/ssh/sshd_config
+            echo 'ForceCommand internal-sftp' >> /etc/ssh/sshd_config
+            echo 'PermitRootLogin no' >> /etc/ssh/sshd_config
+            systemctl restart sshd
+
+            # Setup watcher that will alert SNS topic when a new file has been uploaded
+            echo '#!/bin/bash' > watchDirectory.sh
+            echo 'inotifywait -m /data/${Username}/upload -e create |' >> watchDirectory.sh
+            echo '    while read dir action file; do' >> watchDirectory.sh
+            echo '        aws sns publish --topic-arn ${NotificationTopic} --region ${AWS::Region} --message "The file $file has been uploaded in directory $dir on the SFTP server in AWS account:${AWS::AccountId}" ' >> watchDirectory.sh
+            echo '    done' >> watchDirectory.sh
+            chmod o+x watchDirectory.sh
+            nohup ./watchDirectory.sh &
+            aws sns publish --topic-arn ${NotificationTopic} --region ${AWS::Region} --message "The SFTP server has been setup with the username ${Username} in AWS account:${AWS::AccountId}"
+
+Outputs:
+  ServerIP:
+    Description: "IP address for the SFTP server"
+    Value: !GetAtt SFTPInstance.PublicIp
+  Username:
+    Description: "SFTP User"
+    Value: !Ref Username
+  SNSTopic:
+    Description: "SNS Topic used for alerts"
+    Value: !Ref NotificationTopic
+
+
